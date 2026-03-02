@@ -1,0 +1,344 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Trend Continuation Strategy — Multi-Timeframe EMA Alignment
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Core philosophy:
+//   Trade continuation in clearly established trends. 
+
+// Entry model:
+//   1. Identify trend on Daily  (EMA 9 > 20, price above both)
+//   2. Confirm alignment on 1H  (same structure)
+//   3. Confirm alignment on 5m  (same structure + swing HH/HL or LH/LL)
+//   4. Ensure no major barrier ahead (200 EMA filter)
+//   5. Wait for pullback to 9/20 EMA (rejection candle)
+//   6. Enter on BREAK of the pullback candle's high (longs) or low (shorts)
+//   7. SL below the recent swing low (structural), TP at fixed 2R
+//   8. ONE trade per day — every trade is a day trade (closes at session end)
+//
+// Designed for 5-minute chart execution.
+
+//@version=5
+strategy("Trend Continuation – MTF Alignment", "Forex Alignment", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=5, calc_on_order_fills=true, calc_on_every_tick=false)
+
+// ── Inputs ──────────────────────────────────────────────────────────────────
+grpEMA = "EMA Settings"
+fastLen = input.int(9,  "Fast EMA (Trend Tracker)", minval=1, group=grpEMA)
+slowLen = input.int(20, "Slow EMA (Confirmation)",  minval=1, group=grpEMA)
+
+grpTrend = "Trend Structure"
+pivotLen = input.int(8, "Pivot Lookback", minval=2, group=grpTrend, tooltip="Bars each side to confirm a swing point. Higher = fewer, more meaningful pivots.")
+
+grpPB = "Pullback & Entry"
+pbPct      = input.float(0.3, "EMA Touch Threshold (%)", step=0.05, group=grpPB, tooltip="How close the wick must get to the 9 EMA to count as a pullback touch.")
+maxPbAge   = input.int(5,     "Pullback Setup Lifespan (bars)", minval=2, group=grpPB, tooltip="How long the pending break-entry order stays active after the pullback candle.")
+
+grpRisk = "Risk Management"
+rrRatio = input.float(2.0, "Risk : Reward", step=0.1, minval=0.5, group=grpRisk, tooltip="Fixed R:R. SL = recent swing low/high (structural). TP = entry + R × this value.")
+slPad   = input.float(0.05, "SL Padding Beyond Swing (%)", step=0.01, group=grpRisk, tooltip="Extra padding beyond the swing low/high for the stop-loss.")
+use200  = input.bool(true, "200 EMA Barrier Filter", group=grpRisk, tooltip="Avoid trades when price is on the wrong side of the Daily 200 EMA.")
+
+grpSession = "Session"
+sessionEndHour   = input.int(15, "Session End Hour",   minval=0, maxval=23, group=grpSession, tooltip="Hour of session close in exchange timezone.")
+sessionEndMinute = input.int(55, "Session End Minute", minval=0, maxval=59, group=grpSession, tooltip="Minute of session close. Position closes at this time.")
+sessionTZ        = input.string("America/New_York", "Timezone", options=["America/New_York", "America/Chicago", "America/Los_Angeles", "Europe/London", "Asia/Tokyo", "UTC"], group=grpSession)
+
+grpVis = "Visuals"
+showHTF    = input.bool(false, "Show HTF EMAs",      group=grpVis)
+showZone   = input.bool(true,  "Show EMA Zone Fill", group=grpVis)
+showSwings = input.bool(false, "Show Swing Points",  group=grpVis)
+showBoxes  = input.bool(true,  "Show Trade Projection", group=grpVis, tooltip="Blue = TP zone, Red = SL zone.")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STEP 1 — DAILY: Trend Direction
+// ═══════════════════════════════════════════════════════════════════════════
+d_ema9   = request.security(syminfo.tickerid, "D", ta.ema(close, fastLen), lookahead=barmerge.lookahead_off)
+d_ema20  = request.security(syminfo.tickerid, "D", ta.ema(close, slowLen), lookahead=barmerge.lookahead_off)
+d_ema200 = request.security(syminfo.tickerid, "D", ta.ema(close, 200),     lookahead=barmerge.lookahead_off)
+d_close  = request.security(syminfo.tickerid, "D", close,                  lookahead=barmerge.lookahead_off)
+
+d_bull = d_ema9 > d_ema20 and d_close > d_ema9
+d_bear = d_ema9 < d_ema20 and d_close < d_ema9
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STEP 2 — 1-HOUR: Trend Confirmation
+// ═══════════════════════════════════════════════════════════════════════════
+h_ema9  = request.security(syminfo.tickerid, "60", ta.ema(close, fastLen), lookahead=barmerge.lookahead_off)
+h_ema20 = request.security(syminfo.tickerid, "60", ta.ema(close, slowLen), lookahead=barmerge.lookahead_off)
+h_close = request.security(syminfo.tickerid, "60", close,                  lookahead=barmerge.lookahead_off)
+
+h_bull = h_ema9 > h_ema20 and h_close > h_ema9
+h_bear = h_ema9 < h_ema20 and h_close < h_ema9
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STEP 3 — 5-MIN: Execution Timeframe
+// ═══════════════════════════════════════════════════════════════════════════
+ema9  = ta.ema(close, fastLen)
+ema20 = ta.ema(close, slowLen)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RULE 1 — Clear Trend Structure (Swing Highs & Lows)
+// ═══════════════════════════════════════════════════════════════════════════
+swingHigh = ta.pivothigh(high, pivotLen, pivotLen)
+swingLow  = ta.pivotlow(low,  pivotLen, pivotLen)
+
+var float prevSH = na
+var float lastSH = na
+var float prevSL = na
+var float lastSL = na
+
+if not na(swingHigh)
+    prevSH := lastSH
+    lastSH := swingHigh
+
+if not na(swingLow)
+    prevSL := lastSL
+    lastSL := swingLow
+
+hasHH = not na(prevSH) and not na(lastSH) and lastSH > prevSH
+hasHL = not na(prevSL) and not na(lastSL) and lastSL > prevSL
+hasLH = not na(prevSH) and not na(lastSH) and lastSH < prevSH
+hasLL = not na(prevSL) and not na(lastSL) and lastSL < prevSL
+
+swingUptrend   = hasHH and hasHL
+swingDowntrend = hasLH and hasLL
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RULE 2 — Clean Chart Space (200 EMA Barrier)
+// ═══════════════════════════════════════════════════════════════════════════
+clearBull = not use200 or d_close > d_ema200
+clearBear = not use200 or d_close < d_ema200
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FULL ALIGNMENT — All Three Timeframes Agree
+// ═══════════════════════════════════════════════════════════════════════════
+allBull = d_bull and h_bull and ema9 > ema20 and swingUptrend and clearBull
+allBear = d_bear and h_bear and ema9 < ema20 and swingDowntrend and clearBear
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RULE 3 — Pullback to the 9 or 20 EMA (Rejection Candle)
+// ═══════════════════════════════════════════════════════════════════════════
+emaUpper = math.max(ema9, ema20)
+emaLower = math.min(ema9, ema20)
+
+pbCandleBull = allBull                                                and
+     low <= ema9 * (1 + pbPct / 100)                                 and
+     low >= emaLower * (1 - pbPct / 100)                             and
+     close > ema9                                                    and
+     close > open
+
+pbCandleBear = allBear                                                and
+     high >= ema9 * (1 - pbPct / 100)                                and
+     high <= emaUpper * (1 + pbPct / 100)                            and
+     close < ema9                                                    and
+     close < open
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SESSION MANAGEMENT — End-of-Day Close
+// ═══════════════════════════════════════════════════════════════════════════
+// Uses explicit hour:minute check in the exchange timezone (like the
+// reference ORB script). time_close returns the BAR close time on intraday
+// charts, NOT the session end — so we cannot rely on it.
+
+sessionTime = time(timeframe.period, "0000-2400:23456", sessionTZ)
+sessionHour = hour(sessionTime, sessionTZ)
+sessionMin  = minute(sessionTime, sessionTZ)
+
+isSessionEnd = sessionHour == sessionEndHour and sessionMin >= sessionEndMinute
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ENTRY — One Trade Per Day (Break of Pullback Candle)
+// ═══════════════════════════════════════════════════════════════════════════
+// Maximum ONE position per trading day. Positions are force-closed at
+// session end. SL and TP are managed via strategy.exit() which is
+// re-applied each bar the position is open to ensure it sticks.
+
+var float pendingSL = na       // SL price for the pending/active trade
+var float pendingTP = na       // TP price for the pending/active trade
+var float pbHigh = na
+var float pbLow  = na
+var int   pbBar  = 0
+var int   pbSide = 0           // 1 = long pending, -1 = short pending
+var box   tpBox  = na          // Trade projection: TP zone
+var box   slBox  = na          // Trade projection: SL zone
+
+// ── One trade per day tracking ──────────────────────────────────────────────
+var int tradesToday = 0
+
+newDay = ta.change(time("1D"))
+if newDay
+    tradesToday := 0
+    tpBox       := na
+    slBox       := na
+
+// Detect new fill — recalculate TP based on actual fill price
+justFilled = strategy.position_size != 0 and strategy.position_size[1] == 0
+if justFilled
+    tradesToday += 1
+    pbSide      := 0
+    // Recalculate TP using real fill price for accurate R:R
+    actualEntry = strategy.position_avg_price
+    if strategy.position_size > 0 and not na(pendingSL)
+        riskActual  = actualEntry - pendingSL
+        pendingTP  := actualEntry + riskActual * rrRatio
+        if showBoxes and not na(tpBox)
+            box.set_top(tpBox, pendingTP)
+            box.set_bottom(tpBox, actualEntry)
+        if showBoxes and not na(slBox)
+            box.set_top(slBox, actualEntry)
+    else if strategy.position_size < 0 and not na(pendingSL)
+        riskActual  = pendingSL - actualEntry
+        pendingTP  := actualEntry - riskActual * rrRatio
+        if showBoxes and not na(tpBox)
+            box.set_top(tpBox, actualEntry)
+            box.set_bottom(tpBox, pendingTP)
+        if showBoxes and not na(slBox)
+            box.set_bottom(slBox, actualEntry)
+
+// Detect position close (SL, TP, or EOD) — finalize projection boxes
+posJustClosed = strategy.position_size == 0 and strategy.position_size[1] != 0
+if posJustClosed
+    if not na(tpBox)
+        boxLeft    = box.get_left(tpBox)
+        finalRight = math.max(boxLeft + 8, bar_index)
+        box.set_right(tpBox, finalRight)
+        tpBox := na
+    if not na(slBox)
+        boxLeft    = box.get_left(slBox)
+        finalRight = math.max(boxLeft + 8, bar_index)
+        box.set_right(slBox, finalRight)
+        slBox := na
+    pendingSL := na
+    pendingTP := na
+
+isFlat     = strategy.position_size == 0
+dayAllowed = tradesToday < 1
+
+// ── End-of-day forced close ─────────────────────────────────────────────────
+if isSessionEnd and not isFlat
+    if not na(tpBox)
+        boxLeft    = box.get_left(tpBox)
+        finalRight = math.max(boxLeft + 8, bar_index)
+        box.set_right(tpBox, finalRight)
+        tpBox := na
+    if not na(slBox)
+        boxLeft    = box.get_left(slBox)
+        finalRight = math.max(boxLeft + 8, bar_index)
+        box.set_right(slBox, finalRight)
+        slBox := na
+    strategy.close_all(comment="EOD Close")
+    pbSide   := 0
+    pendingSL := na
+    pendingTP := na
+
+// Also cancel unfilled pending orders at session end
+if isSessionEnd and pbSide != 0
+    strategy.cancel("Long")
+    strategy.cancel("Short")
+    if not na(tpBox)
+        box.delete(tpBox)
+        tpBox := na
+    if not na(slBox)
+        box.delete(slBox)
+        slBox := na
+    pbSide := 0
+
+// ── Register pullback candle & place pending stop-entry orders ──────────────
+// Only place new setups on confirmed bars and outside session end window
+if barstate.isconfirmed and not isSessionEnd
+
+    if pbCandleBull and isFlat and dayAllowed
+        calcSL  = lastSL * (1 - slPad / 100)
+        riskPts = high - calcSL
+
+        if riskPts > 0  // Safety: skip if SL is above entry level
+            pbHigh    := high
+            pbLow     := low
+            pbBar     := bar_index
+            pbSide    := 1
+            pendingSL := calcSL
+            pendingTP := high + riskPts * rrRatio
+
+            strategy.entry("Long", strategy.long, stop=high)
+
+            if showBoxes
+                if not na(tpBox)
+                    box.delete(tpBox)
+                if not na(slBox)
+                    box.delete(slBox)
+                tpBox := box.new(bar_index, pendingTP, bar_index + 8, high,      bgcolor=color.new(color.blue, 70), border_width=0)
+                slBox := box.new(bar_index, high,      bar_index + 8, pendingSL, bgcolor=color.new(color.red,  70), border_width=0)
+
+    if pbCandleBear and isFlat and dayAllowed
+        calcSL  = lastSH * (1 + slPad / 100)
+        riskPts = calcSL - low
+
+        if riskPts > 0  // Safety: skip if SL is below entry level
+            pbHigh    := high
+            pbLow     := low
+            pbBar     := bar_index
+            pbSide    := -1
+            pendingSL := calcSL
+            pendingTP := low - riskPts * rrRatio
+
+            strategy.entry("Short", strategy.short, stop=low)
+
+            if showBoxes
+                if not na(tpBox)
+                    box.delete(tpBox)
+                if not na(slBox)
+                    box.delete(slBox)
+                tpBox := box.new(bar_index, low,       bar_index + 8, pendingTP, bgcolor=color.new(color.blue, 70), border_width=0)
+                slBox := box.new(bar_index, pendingSL, bar_index + 8, low,       bgcolor=color.new(color.red,  70), border_width=0)
+
+// ── Apply SL/TP every bar while in a position ───────────────────────────────
+// strategy.exit() must persist — re-apply each bar to ensure the levels
+// stay active after the stop-entry fills.
+if strategy.position_size > 0 and not na(pendingSL) and not na(pendingTP)
+    strategy.exit("Long TP/SL", "Long", stop=pendingSL, limit=pendingTP)
+
+if strategy.position_size < 0 and not na(pendingSL) and not na(pendingTP)
+    strategy.exit("Short TP/SL", "Short", stop=pendingSL, limit=pendingTP)
+
+// Extend projection boxes while in position or pending
+if strategy.position_size != 0 or pbSide != 0
+    if not na(tpBox)
+        box.set_right(tpBox, bar_index + 1)
+    if not na(slBox)
+        box.set_right(slBox, bar_index + 1)
+
+// ── Cancel stale or invalidated pending setups ──────────────────────────────
+pbAge   = bar_index - pbBar
+pbStale = pbSide != 0 and pbAge > maxPbAge
+pbLost  = (pbSide == 1 and not allBull) or (pbSide == -1 and not allBear)
+
+if (pbStale or pbLost) and isFlat
+    strategy.cancel("Long")
+    strategy.cancel("Short")
+    pbSide   := 0
+    pendingSL := na
+    pendingTP := na
+    if not na(tpBox)
+        box.delete(tpBox)
+        tpBox := na
+    if not na(slBox)
+        box.delete(slBox)
+        slBox := na
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PLOTTING — Minimal & Functional
+// ═══════════════════════════════════════════════════════════════════════════
+pFast = plot(ema9,  "EMA 9",  color=color.new(#ff9800, 20), linewidth=1)
+pSlow = plot(ema20, "EMA 20", color=color.new(#2196f3, 20), linewidth=1)
+fill(pFast, pSlow, color=showZone ? (ema9 > ema20 ? color.new(#4caf50, 90) : color.new(#f44336, 90)) : na, title="EMA Zone")
+
+plot(showHTF ? d_ema9  : na, "D EMA 9",   color=color.new(color.lime, 70), linewidth=1, style=plot.style_stepline)
+plot(showHTF ? d_ema20 : na, "D EMA 20",  color=color.new(color.lime, 85), linewidth=1, style=plot.style_stepline)
+plot(showHTF ? h_ema9  : na, "H EMA 9",   color=color.new(color.aqua, 70), linewidth=1, style=plot.style_stepline)
+plot(showHTF ? h_ema20 : na, "H EMA 20",  color=color.new(color.aqua, 85), linewidth=1, style=plot.style_stepline)
+
+// Pullback candle highlight
+barcolor(pbCandleBull ? color.new(#4caf50, 60) : pbCandleBear ? color.new(#f44336, 60) : na, title="Pullback Candle")
+
+// Swing points
+plotshape(showSwings and not na(swingHigh), title="SH", style=shape.diamond, location=location.abovebar, color=color.new(#ff9800, 30), size=size.tiny, offset=-pivotLen)
+plotshape(showSwings and not na(swingLow),  title="SL", style=shape.diamond, location=location.belowbar, color=color.new(#2196f3, 30), size=size.tiny, offset=-pivotLen)

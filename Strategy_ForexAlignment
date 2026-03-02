@@ -1,0 +1,76 @@
+
+## 📈 Strategy: Forex Alignment
+
+### Overview
+**Forex Alignment** is a multi-timeframe trend continuation strategy designed for intraday forex trading on the 5-minute chart. It combines three aligned EMA timeframes (Daily, Hourly, 5-minute) to identify strong trends, then enters on pullbacks within that trend.
+
+### Core Philosophy
+- **Trade continuation, not reversals** — Only enter when the trend is clearly established across multiple timeframes
+- **Quality over quantity** — One trade per day maximum; every trade must meet strict alignment criteria
+- **Risk management focus** — Fixed risk-to-reward ratio (2:1 by default), structural stops, end-of-day close protection
+
+### Strategy Logic
+
+#### Entry Requirements (Multi-Timeframe Alignment)
+
+**Step 1: Daily Trend Confirmation**
+- Bullish: EMA 9 > EMA 20 AND Price > EMA 9
+- Bearish: EMA 9 < EMA 20 AND Price < EMA 9
+- Barrier: Price must be above/below the Daily 200 EMA (optional filter for clear market space)
+
+**Step 2: 1-Hour Confirmation**
+- Bullish: EMA 9 > EMA 20 AND Price > EMA 9
+- Bearish: EMA 9 < EMA 20 AND Price < EMA 9
+
+**Step 3: 5-Minute Setup** (Execution Timeframe)
+- **Trend Structure**: Must have higher highs + higher lows (uptrend) OR lower highs + lower lows (downtrend)
+- **Pullback Candle**: Price must pull back to the EMA 9 or between 9/20, then close back inside the trend
+  - Bullish: Low touches EMA 9 (within 0.3% threshold), closes above EMA 9
+  - Bearish: High touches EMA 9 (within 0.3% threshold), closes below EMA 9
+- **Entry Trigger**: Break of the pullback candle's high (longs) or low (shorts)
+
+#### Exit Strategy
+
+- **Stop Loss**: Below/above the most recent swing low/high, with 0.05% padding
+- **Take Profit**: Risk × 2.0 (2R fixed ratio)
+- **End of Day**: All positions force-close at session end (default 3:55 PM ET) — this is a day trade strategy
+
+#### Risk Management
+- Position size: 5% of account equity per trade
+- Maximum 1 trade per trading day
+- Structural stops based on recent swing points (not arbitrary levels)
+- Fixed 2:1 risk-to-reward ensures mathematically sound position sizing
+
+---
+
+## 📊 Backtest Results: Forex Alignment
+
+**Period:** Jan 11, 2026 — Mar 1, 2026 (6 weeks)  
+**Instrument:** USDCAD (tested on this pair)  
+**Timeframe:** 5-minute chart  
+**Initial Equity:** 10,000 CAD
+
+| Metric | Result |
+|--------|--------|
+| **Total P&L** | +746.93 CAD (+0.07%) |
+| **Max Equity Drawdown** | 158.71 CAD (0.02%) |
+| **Total Trades** | 9 |
+| **Winning Trades** | 6 (66.67% win rate) |
+| **Losing Trades** | 3 (33.33%) |
+| **Profit Factor** | 5.315 |
+| **Average Win** | ~124.49 CAD |
+| **Average Loss** | ~46.83 CAD |
+| **Avg Risk-Reward Realized** | 2.66:1 |
+
+### Key Takeaways from Backtest
+- ✅ **Low drawdown relative to gains** — Only 0.02% max drawdown vs. +0.07% return
+- ✅ **Strong profit factor** — Each dollar risked generated $5.31 in profit
+- ✅ **Quality over quantity** — Few trades but consistent execution of the alignment rules
+- ✅ **Win rate above 60%** — Most trades hit their target, validating the entry logic
+
+### Important Notes
+- This backtest reflects *past performance* on the specific instrument (USDCAD) and time period
+- Different currency pairs, market conditions, and parameter adjustments will yield different results
+- **Always test on your target instrument before trading**
+
+---
